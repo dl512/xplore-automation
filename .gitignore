@@ -1,0 +1,21 @@
+# Secrets and local-only
+.env
+.env.*
+!.env.example
+*.pkl
+cookies.pkl
+**/global-headlines*.json
+**/*service-account*.json
+**/*credentials*.json
+ig_checkpoints.json
+session-instaloader/
+
+# Runtime / tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+*.log
+downloaded_image.jpg
