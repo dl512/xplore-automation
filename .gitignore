@@ -10,6 +10,7 @@ cookies.pkl
 ig_checkpoints.json
 processed_ig_links.txt
 processed_ig_links.csv
+processed_home_feed_links.txt
 session-instaloader/
 
 # Runtime / tooling

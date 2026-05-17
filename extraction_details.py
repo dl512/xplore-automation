@@ -648,3 +648,82 @@ def extract_info_with_model_fallback(details_str: str, post_date=None):
     return response, tags, category
 
 
+def is_event_post(caption, history=None, post_date=None):
+    """
+    Return 'Y' or 'N': whether an Instagram caption is a HK event flyer (same logic as xplore_automation.is_event).
+    """
+    from datetime import date as date_cls
+    from openai import OpenAI
+
+    from llm_env import get_openai_compatible_credentials
+
+    history = history or []
+    if not caption:
+        return "N"
+
+    caption_str = str(caption) if not isinstance(caption, str) else caption
+    current_year = date_cls.today().year
+    prompt = f"Read the following Instagram post: {caption_str}\n"
+
+    if post_date:
+        prompt += f"IMPORTANT: This Instagram post was posted on {post_date}. "
+        prompt += f"When interpreting dates mentioned in the post, consider that the post was made on {post_date}. "
+        prompt += (
+            f"For example, if the post was made on {post_date} and mentions an event on October 2, "
+            f"the event is likely on October 2 of the same year as the post date "
+            f"({post_date.split(', ')[-1] if ', ' in post_date else current_year}), "
+            f"not the current year ({current_year}). "
+        )
+
+    prompt += (
+        f"Determine if it is an event flyer for a specific event in Hong Kong at or after {date_cls.today()}. "
+    )
+    prompt += "Such post should include the activities' details such as date, time, and venue. "
+    prompt += f"Please think step by step. Reconfirm if it is before or after {date_cls.today()}. "
+    prompt += (
+        "\n\nCRITICAL: Posts about shop opening hours, operating hours, business hours, or store schedules are NOT events. "
+    )
+    prompt += (
+        "If the post is primarily about announcing when a shop/cafe/bookstore/restaurant is open or closed "
+        "(e.g., '初一｜休息', '營業時間', 'opening hours', 'operating hours'), respond 'N'. "
+    )
+    prompt += (
+        "These are business hour announcements, not event flyers. Only respond 'Y' if it's an actual event "
+        "(exhibition, workshop, performance, gathering, etc.) with specific dates, times, and activities. "
+    )
+
+    if post_date:
+        year_match = re.search(r"(\d{4})", post_date)
+        if year_match:
+            prompt += (
+                f"You can assume the dates mentioned in the post are in {int(year_match.group(1))} "
+                f"(the year when the post was made), unless explicitly stated otherwise. "
+            )
+        else:
+            prompt += f"You can assume the dates mentioned in the post is in {current_year}. "
+    else:
+        prompt += f"You can assume the dates mentioned in the post is in {current_year}. "
+
+    prompt += "If it is explicitly mentioned that the event is not in HK, respond 'N'."
+    prompt += f"If it is already mentioned in the list: {history}, respond 'N'."
+    prompt += "Please only response 'Y' or 'N'."
+
+    try:
+        api_key, base_url = get_openai_compatible_credentials()
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        event_model = os.getenv("OPENAI_EVENT_MODEL", "openai/gpt-oss-120b")
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=event_model,
+        )
+        content = response.choices[0].message.content
+        if isinstance(content, list):
+            if len(content) > 1 and isinstance(content[1], dict):
+                return str(content[1].get("text", "N")).strip()
+            return str(content[0]).strip()
+        return (content or "N").strip()
+    except Exception as e:
+        print(f"  [WARN] is_event_post failed: {e}")
+        return "N"
+
+
