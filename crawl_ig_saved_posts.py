@@ -6,14 +6,20 @@ Uses Selenium + Chrome (same setup as xplore_automation.py). Requires login via 
 Cookies are read from cookies.pkl (create once by running with --save-cookies and logging in).
 
 Usage:
-  # First time: create cookies (browser opens; log in to IG, then press Enter)
+  # First time: create cookies on a machine with a display (your PC), or on VM:
+  #   xvfb-run -a python crawl_ig_saved_posts.py --save-cookies --no-headless
+  # Then scp cookies.pkl to servers without a GUI.
   python crawl_ig_saved_posts.py --save-cookies
 
-  # Crawl saved posts, extract event info from each post, append to Google Sheet (input tab)
+  # Crawl saved posts, extract event info from each post, append to Google Sheet (input tab).
+  # Skips URLs in processed_ig_links.txt (default); appends each URL after it is processed.
   python crawl_ig_saved_posts.py
 
   # Only crawl and print links (no extraction / sheet)
   python crawl_ig_saved_posts.py --no-extract
+
+  # Custom tracker file (.txt one URL per line, or .csv with header 'url')
+  python crawl_ig_saved_posts.py --tracker /path/on/vm/processed_ig_links.csv
 
   # If you log in as primary but want saved posts for xplore.hk:
   python crawl_ig_saved_posts.py --switch-account xplore.hk --username xplore.hk
@@ -24,10 +30,12 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import pickle
 import re
+import sys
 import time
 import uuid
 
@@ -160,6 +168,62 @@ COOKIES_FILE = "cookies.pkl"
 INSTAGRAM_HOME = "https://www.instagram.com"
 WAIT_TIMEOUT = 15
 DELAY_BETWEEN_POSTS = 2  # seconds between fetching posts (rate limit)
+DEFAULT_PROCESSED_TRACKER = "processed_ig_links.txt"
+
+
+def normalize_post_url(url):
+    """Match dedup logic in extract_post_links: no query string, no trailing slash."""
+    if not url:
+        return ""
+    return url.strip().split("?")[0].rstrip("/")
+
+
+def load_processed_links(tracker_path):
+    """Load set of normalized URLs already processed (txt: one per line, or csv with 'url' column)."""
+    out = set()
+    if not tracker_path or not os.path.isfile(tracker_path):
+        return out
+    try:
+        if tracker_path.lower().endswith(".csv"):
+            with open(tracker_path, encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    cell = (row[0] or "").strip()
+                    if not cell or cell.lower() == "url":
+                        continue
+                    out.add(normalize_post_url(cell))
+        else:
+            with open(tracker_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    out.add(normalize_post_url(line))
+    except Exception as e:
+        print(f"[WARN] Could not read tracker {tracker_path}: {e}")
+    return out
+
+
+def append_processed_link(tracker_path, normalized_url, processed_set):
+    """Append one normalized URL to tracker and update processed_set."""
+    if not tracker_path or not normalized_url or normalized_url in processed_set:
+        return
+    try:
+        if tracker_path.lower().endswith(".csv"):
+            file_exists = os.path.isfile(tracker_path) and os.path.getsize(tracker_path) > 0
+            with open(tracker_path, "a", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                if not file_exists:
+                    w.writerow(["url"])
+                w.writerow([normalized_url])
+        else:
+            with open(tracker_path, "a", encoding="utf-8") as f:
+                f.write(normalized_url + "\n")
+        processed_set.add(normalized_url)
+    except Exception as e:
+        print(f"[WARN] Could not append to tracker {tracker_path}: {e}")
 
 
 def get_content_sync(url):
@@ -276,11 +340,25 @@ def build_event_info(username, response, tags, category, url, photo_url=None):
 
 
 def create_driver(headless=True):
+    if not headless and not os.environ.get("DISPLAY"):
+        print(
+            "Non-headless Chrome needs a GUI display (DISPLAY is unset).\n"
+            "On a plain SSH droplet you cannot interactively log in this way.\n"
+            "  • Recommended: run --save-cookies on your PC, then scp cookies.pkl here.\n"
+            "  • Or on the VM only: sudo apt install -y xvfb\n"
+            "      xvfb-run -a python crawl_ig_saved_posts.py --save-cookies --no-headless\n"
+            "    (virtual framebuffer; still awkward for 2FA — PC is easier.)\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     options = Options()
     if headless:
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     driver = webdriver.Chrome(
@@ -507,6 +585,21 @@ def main():
         action="store_true",
         help="Only crawl and print links; do not extract event info or write to Google Sheet.",
     )
+    parser.add_argument(
+        "--tracker",
+        default=DEFAULT_PROCESSED_TRACKER,
+        metavar="PATH",
+        help=(
+            "File of processed post URLs (.txt one per line, or .csv with header 'url'). "
+            "During extraction, skip URLs listed here; append after each post is processed. "
+            f"Default: {DEFAULT_PROCESSED_TRACKER}"
+        ),
+    )
+    parser.add_argument(
+        "--no-tracker",
+        action="store_true",
+        help="Process every crawled URL even if it was handled on a previous run.",
+    )
     args = parser.parse_args()
 
     headless = not args.no_headless and not args.save_cookies
@@ -515,7 +608,12 @@ def main():
     try:
         if args.save_cookies:
             driver.get(INSTAGRAM_HOME)
-            print("Log in to Instagram in the browser, then press Enter here.")
+            print(
+                "In the browser: finish login (password, 2FA, 'Save login info?' if shown).\n"
+                "If Instagram shows multiple accounts (e.g. david__dlau vs xplore.hk), click the one\n"
+                "you use for Saved posts (e.g. xplore.hk) and wait until the home feed loads for that account.\n"
+                "Then return here and press Enter to save cookies.pkl for this session."
+            )
             input()
             save_cookies(driver)
             return
@@ -549,9 +647,30 @@ def main():
         links = extract_post_links(driver)
         driver.quit()
 
-        print(f"\nFound {len(links)} saved post(s). Links:\n")
+        tracker_path = None
+        processed_urls = set()
+        if not args.no_extract and not args.no_tracker:
+            tracker_path = os.path.abspath(args.tracker)
+            processed_urls = load_processed_links(tracker_path)
+
+        new_links = [
+            u for u in links if normalize_post_url(u) not in processed_urls
+        ]
+        if processed_urls:
+            print(
+                f"\nFound {len(links)} saved post(s) "
+                f"({len(new_links)} not yet in tracker: {tracker_path})."
+            )
+        else:
+            print(f"\nFound {len(links)} saved post(s).")
+        if tracker_path and not os.path.isfile(tracker_path):
+            print(f"  Tracker file will be created on first processed URL: {tracker_path}")
+        print()
         for u in links:
-            print(u)
+            tag = ""
+            if processed_urls and normalize_post_url(u) in processed_urls:
+                tag = " [already processed]"
+            print(f"{u}{tag}")
 
         if not args.no_extract and links:
             print("\nExtracting event info and writing to Google Sheet...")
@@ -559,40 +678,58 @@ def main():
                 f"  [LLM] primary: {', '.join(_primary_models_from_env())} "
                 f"-> fallback: {_fallback_model_from_env()}"
             )
+            if tracker_path:
+                print(f"  Tracker: {len(processed_urls)} URL(s) in {tracker_path}")
             sheet, current_row = init_google_sheets()
             if sheet is None:
-                print("[WARN] Google Sheet not available; skipping extract/save.")
-            else:
-                written_total = 0
-                for i, url in enumerate(links):
-                    time.sleep(DELAY_BETWEEN_POSTS)
-                    soup = get_content_sync(url)
-                    if not soup:
-                        continue
-                    username, details, post_date = extract_username_and_details(soup)
-                    details_str = (details or "").strip()
-                    if not details_str:
-                        continue
-                    try:
-                        response, tags, category = extract_info_with_model_fallback(
-                            details_str, post_date=post_date
-                        )
-                    except Exception as e:
-                        print(f"  [WARN] extract_info (all models) failed for {url}: {e}")
-                        continue
-                    photo_url = extract_photo(url)
-                    event_list = build_event_info(username, response, tags, category, url, photo_url=photo_url)
+                print("[WARN] Google Sheet not available; extraction runs but rows are not saved.")
+            written_total = 0
+            skipped_tracker = 0
+            to_process = new_links if tracker_path else links
+            for i, url in enumerate(to_process):
+                norm = normalize_post_url(url)
+                time.sleep(DELAY_BETWEEN_POSTS)
+                soup = get_content_sync(url)
+                if not soup:
+                    continue
+                username, details, post_date = extract_username_and_details(soup)
+                details_str = (details or "").strip()
+                if not details_str:
+                    continue
+                try:
+                    response, tags, category = extract_info_with_model_fallback(
+                        details_str, post_date=post_date
+                    )
+                except Exception as e:
+                    print(f"  [WARN] extract_info (all models) failed for {url}: {e}")
+                    continue
+                photo_url = extract_photo(url)
+                event_list = build_event_info(
+                    username, response, tags, category, url, photo_url=photo_url
+                )
+                if sheet is not None:
                     for event_dict in event_list:
                         key_fields = ["Event name", "Date", "Time", "Location"]
-                        if not any(event_dict.get(f) and str(event_dict.get(f)).strip() for f in key_fields):
+                        if not any(
+                            event_dict.get(f) and str(event_dict.get(f)).strip()
+                            for f in key_fields
+                        ):
                             continue
                         try:
-                            sheet, current_row = write_event_to_sheet(sheet, current_row, event_dict)
+                            sheet, current_row = write_event_to_sheet(
+                                sheet, current_row, event_dict
+                            )
                             written_total += 1
                         except Exception as e:
                             print(f"  [WARN] write failed: {e}")
-                    print(f"  Processed {i + 1}/{len(links)}: {url[:60]}...")
+                if tracker_path:
+                    append_processed_link(tracker_path, norm, processed_urls)
+                print(f"  Processed {i + 1}/{len(to_process)}: {url[:60]}...")
+            skipped_tracker = len(links) - len(to_process)
+            if sheet is not None:
                 print(f"\nWrote {written_total} event(s) to Google Sheet (input).")
+            if skipped_tracker:
+                print(f"Skipped {skipped_tracker} link(s) already in tracker.")
 
     finally:
         try:

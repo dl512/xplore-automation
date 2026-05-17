@@ -8,6 +8,8 @@ cookies.pkl
 **/*service-account*.json
 **/*credentials*.json
 ig_checkpoints.json
+processed_ig_links.txt
+processed_ig_links.csv
 session-instaloader/
 
 # Runtime / tooling
