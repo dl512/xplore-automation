@@ -106,7 +106,68 @@ _SHEETS_AVAILABLE = bool(
 
 BUCKET_NAME = "ig-photo"
 _storage_bucket = None
+_ig_requests_session = None
+IG_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
+
+def extract_shortcode_from_url(url):
+    """Parse shortcode from /p/ or /reel/ Instagram URLs."""
+    if not url:
+        return ""
+    m = re.search(r"/(?:p|reel)/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else ""
+
+
+def get_requests_session():
+    """requests.Session with cookies.pkl (for post HTML when Selenium driver is unavailable)."""
+    global _ig_requests_session
+    if _ig_requests_session is not None:
+        return _ig_requests_session
+    session = requests.Session()
+    session.headers.update(IG_REQUEST_HEADERS)
+    if os.path.exists(COOKIES_FILE):
+        try:
+            session.get(INSTAGRAM_HOME, timeout=15)
+            with open(COOKIES_FILE, "rb") as f:
+                for cookie in pickle.load(f):
+                    session.cookies.set(
+                        cookie["name"],
+                        cookie["value"],
+                        domain=cookie.get("domain", ".instagram.com"),
+                        path=cookie.get("path", "/"),
+                    )
+        except Exception as e:
+            print(f"[WARN] could not load {COOKIES_FILE} into requests session: {e}")
+    _ig_requests_session = session
+    return session
+
+
+def _load_instaloader_session(L):
+    """Load Instaloader session from session file and/or Selenium cookies.pkl."""
+    try:
+        if os.path.exists("session-instaloader"):
+            L.load_session_from_file("session-instaloader")
+    except Exception:
+        pass
+    if os.path.exists(COOKIES_FILE):
+        try:
+            L.context._session.get(INSTAGRAM_HOME)
+            with open(COOKIES_FILE, "rb") as f:
+                for cookie in pickle.load(f):
+                    L.context._session.cookies.set(
+                        cookie["name"],
+                        cookie["value"],
+                        domain=cookie.get("domain", ".instagram.com"),
+                        path=cookie.get("path", "/"),
+                    )
+        except Exception:
+            pass
 
 def get_storage_bucket():
     """Return GCS bucket for photo upload (ig-photo), or None if credentials unavailable."""
@@ -127,10 +188,14 @@ def get_storage_bucket():
 def manage_photo(image_url):
     """Download image and upload to GCS (ig-photo), return public URL. Same logic as xplore_automation."""
     bucket = get_storage_bucket()
-    if not bucket:
+    if not bucket or not image_url:
         return ""
     try:
-        response = requests.get(image_url, timeout=15)
+        response = requests.get(
+            image_url,
+            timeout=15,
+            headers={**IG_REQUEST_HEADERS, "Referer": "https://www.instagram.com/"},
+        )
         if response.status_code != 200:
             return ""
         local_file = "downloaded_image.jpg"
@@ -147,20 +212,20 @@ def manage_photo(image_url):
 
 
 def extract_photo(url):
-    """Get post image via Instaloader, upload to GCS, return public URL. Same as xplore_automation."""
+    """Get post image via Instaloader, upload to GCS. Returns '' on failure (does not block sheet write)."""
+    shortcode = extract_shortcode_from_url(url)
+    if not shortcode:
+        return ""
     try:
         import instaloader
         L = instaloader.Instaloader()
-        try:
-            if os.path.exists("session-instaloader"):
-                L.load_session_from_file("session-instaloader")
-        except Exception:
-            pass
-        shortcode = url.split("p/")[1].strip("/ ")
+        _load_instaloader_session(L)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
-        return manage_photo(post.url) or ""
+        if post.url:
+            return manage_photo(post.url) or ""
     except Exception:
-        return ""
+        pass
+    return ""
 
 # Profile username whose saved posts we want (must be the logged-in user)
 DEFAULT_USERNAME = "xplore.hk"
@@ -226,12 +291,21 @@ def append_processed_link(tracker_path, normalized_url, processed_set):
         print(f"[WARN] Could not append to tracker {tracker_path}: {e}")
 
 
-def get_content_sync(url):
-    """Fetch post HTML with requests (no login; public meta tags)."""
+def get_content_sync(url, driver=None):
+    """Fetch post HTML. Prefer logged-in Selenium driver; fallback to requests + cookies.pkl."""
+    if driver is not None:
+        try:
+            driver.get(url)
+            time.sleep(1.5)
+            return BeautifulSoup(driver.page_source, "html.parser")
+        except Exception as e:
+            print(f"  [WARN] selenium fetch failed {url}: {e}")
     try:
-        r = requests.get(url, timeout=15)
+        session = get_requests_session()
+        r = session.get(url, timeout=30)
         if r.status_code == 200:
             return BeautifulSoup(r.text, "html.parser")
+        print(f"  [WARN] fetch HTTP {r.status_code} for {url}")
     except Exception as e:
         print(f"  [WARN] fetch failed {url}: {e}")
     return None
@@ -474,38 +548,68 @@ def switch_to_account(driver, target_username):
     return True
 
 
+def dismiss_instagram_popups(driver):
+    for text in ("Not Now", "Not now", "Later"):
+        try:
+            for btn in driver.find_elements(
+                By.XPATH,
+                f"//button[contains(., '{text}')]|//div[@role='button'][contains(., '{text}')]",
+            ):
+                if btn.is_displayed():
+                    btn.click()
+                    time.sleep(1)
+                    break
+        except Exception:
+            pass
+
+
 def go_to_saved_posts_grid(driver, username, url=None):
     """
-    Go to saved posts grid: open https://www.instagram.com/{username}/saved/ then click 'All posts'.
-    More reliable than profile -> Saved tab (works in headless). If url is given and contains
-    'all-posts', just open that URL; otherwise open /saved/ and click 'All posts'.
+    Go to saved posts grid: open /saved/all-posts/ (or click 'All posts' on /saved/).
     """
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     if url and "all-posts" in url:
         driver.get(url)
-        time.sleep(4)
-        return True
-    saved_url = f"https://www.instagram.com/{username}/saved/"
-    driver.get(saved_url)
-    time.sleep(4)
-    # Click "All posts" to open the grid (one click on /saved/ page)
-    for selector in [
-        (By.LINK_TEXT, "All posts"),
-        (By.PARTIAL_LINK_TEXT, "All posts"),
-        (By.XPATH, "//span[text()='All posts']/ancestor::a"),
-        (By.XPATH, "//*[contains(text(), 'All posts')]/ancestor::a"),
-        (By.XPATH, "//a[contains(@href, 'all-posts')]"),
-        (By.LINK_TEXT, "All"),
-        (By.PARTIAL_LINK_TEXT, "All"),
-    ]:
-        try:
-            el = wait.until(EC.element_to_be_clickable((selector[0], selector[1])))
-            el.click()
-            print("Clicked 'All posts'.")
-            break
-        except Exception:
-            continue
+    else:
+        # Direct grid URL is more reliable than click-through
+        driver.get(f"https://www.instagram.com/{username}/saved/all-posts/")
     time.sleep(3)
+    dismiss_instagram_popups(driver)
+
+    if "all-posts" not in (driver.current_url or ""):
+        driver.get(f"https://www.instagram.com/{username}/saved/")
+        time.sleep(3)
+        for selector in [
+            (By.LINK_TEXT, "All posts"),
+            (By.PARTIAL_LINK_TEXT, "All posts"),
+            (By.XPATH, "//span[text()='All posts']/ancestor::a"),
+            (By.XPATH, "//*[contains(text(), 'All posts')]/ancestor::a"),
+            (By.XPATH, "//a[contains(@href, 'all-posts')]"),
+            (By.LINK_TEXT, "All"),
+            (By.PARTIAL_LINK_TEXT, "All"),
+        ]:
+            try:
+                el = wait.until(EC.element_to_be_clickable((selector[0], selector[1])))
+                el.click()
+                print("Clicked 'All posts'.")
+                break
+            except Exception:
+                continue
+        time.sleep(3)
+
+    # Wait until the grid has at least one post link (or timeout)
+    try:
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//a[contains(@href, '/p/') or contains(@href, '/reel/')]")
+            )
+        )
+    except Exception:
+        print(
+            f"[WARN] No post links visible yet on {driver.current_url}. "
+            "Check you are logged in as the account that owns these saved posts."
+        )
+    time.sleep(2)
     return True
 
 
@@ -516,25 +620,37 @@ def extract_post_links(driver, scroll_pauses=3, max_scrolls=50):
     last_count = 0
     no_new_count = 0
 
-    for _ in range(max_scrolls):
-        # Find all post/reel links on current page
+    def collect():
+        nonlocal links, seen
         elements = driver.find_elements(
             By.XPATH,
-            "//a[contains(@href, '/p/') or contains(@href, '/reel/')]",
+            "//main//a[contains(@href, '/p/') or contains(@href, '/reel/')]",
         )
+        if not elements:
+            elements = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href, '/p/') or contains(@href, '/reel/')]",
+            )
         for el in elements:
             try:
                 href = el.get_attribute("href")
                 if not href:
                     continue
-                # Normalize: strip query string for dedup
-                base = href.split("?")[0]
+                base = href.split("?")[0].rstrip("/")
+                if "/liked_by" in base or "/comments" in base:
+                    continue
                 if base not in seen:
                     seen.add(base)
-                    links.append(href)
+                    links.append(href.split("?")[0])
             except Exception:
                 pass
 
+    collect()
+    if not links:
+        time.sleep(5)
+        collect()
+
+    for _ in range(max_scrolls):
         if len(links) == last_count:
             no_new_count += 1
             if no_new_count >= 3:
@@ -543,9 +659,9 @@ def extract_post_links(driver, scroll_pauses=3, max_scrolls=50):
             no_new_count = 0
         last_count = len(links)
 
-        # Scroll down to load more
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(scroll_pauses)
+        collect()
 
     return links
 
@@ -644,8 +760,12 @@ def main():
             return
 
         print("Scrolling to load saved posts...")
+        print(f"  Page: {driver.current_url}")
         links = extract_post_links(driver)
-        driver.quit()
+        keep_driver = not args.no_extract and bool(links)
+        if not keep_driver:
+            driver.quit()
+            driver = None
 
         tracker_path = None
         processed_urls = set()
@@ -689,12 +809,13 @@ def main():
             for i, url in enumerate(to_process):
                 norm = normalize_post_url(url)
                 time.sleep(DELAY_BETWEEN_POSTS)
-                soup = get_content_sync(url)
+                soup = get_content_sync(url, driver=driver)
                 if not soup:
                     continue
                 username, details, post_date = extract_username_and_details(soup)
                 details_str = (details or "").strip()
                 if not details_str:
+                    print(f"  [skip] no caption: {url[:70]}")
                     continue
                 try:
                     response, tags, category = extract_info_with_model_fallback(
@@ -733,7 +854,8 @@ def main():
 
     finally:
         try:
-            driver.quit()
+            if driver is not None:
+                driver.quit()
         except Exception:
             pass
 
