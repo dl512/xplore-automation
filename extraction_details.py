@@ -196,8 +196,16 @@ def create_chain(model, post_date=None):
     ``(prompt | model).invoke`` to log raw text before ``parser.invoke``.
     """
     class EventDetails(BaseModel):
-        event_name: str = Field(description="Name of the event")
-        date: str = Field(description="Date of the event")
+        event_name: str = Field(
+            description=(
+                "Self-contained title for the general public: formal session title from the "
+                "活動日期 block (not marketing/narrative); prefix programme/series name when "
+                "applicable; for films use 《中文》 plus English if given."
+            )
+        )
+        date: str = Field(
+            description="Event date in D/M format; use D/M-D/M for ranges (e.g. 21/8-30/8), never only the start day"
+        )
         time: str = Field(description="Time of the event")
         venue: str = Field(description="Venue of the event")
         cost: str = Field(description="Cost of the event")
@@ -225,7 +233,7 @@ def create_chain(model, post_date=None):
         post_date_context += f"\n\nCRITICAL: The POST DATE ({post_date_dm if post_date_dm else post_date}) and the EVENT DATE are COMPLETELY DIFFERENT. "
         post_date_context += f"The post date is when the post was published, NOT when the event happens. "
         post_date_context += f"NEVER use the post date as the event date unless the post explicitly says '即日起' (from now/starting today) or similar phrases. "
-        post_date_context += f"For example, if the post date is {post_date_dm if post_date_dm else 'February 11'} but the post says '日期：2月14日', extract 14/2 (the event date), NOT {post_date_dm if post_date_dm else '11/2'} (the post date). "
+        post_date_context += f"For example, if the post date is {post_date_dm if post_date_dm else 'February 11'} but the post says '日期：2月14日' or '活動日期：2026年7月1日', extract 14/2 or 1/7 (the event date), NOT {post_date_dm if post_date_dm else '11/2'} (the post date). "
         post_date_context += f"\nCRITICAL EXAMPLE: If the post says '一連三日' (three consecutive days) but does NOT specify which dates, you MUST output 'N/A'. Do NOT invent dates like '{post_date_dm if post_date_dm else '11/2'}-13/2' based on the post date. The post date is NOT the event date. "
         post_date_context += f"\nThe post date is ONLY used for: (1) resolving ambiguous dates like '6/2' (could be June 2 or February 6), and (2) understanding '即日起' to mean starting from the post date. "
         if post_date_dm:
@@ -241,14 +249,16 @@ CRITICAL: Before extracting, carefully scan the ENTIRE post to identify if there
 - Different location markers (e.g., @維園 vs @啟德, different venue names)
 - Clearly separated sections with different dates, times, or venues
 - Multiple event titles or headers (e.g., "【一早共修@維園】" and "【一早共修@啟德】")
+- A main open day / visit day PLUS separate workshop or ticketed sessions listed below (e.g. "【木庫開放日 ＆ 限定工作坊】" and "【7月1日 開放日限定工作坊】")
 If you find multiple events with different locations, dates, or times, you MUST create SEPARATE event entries for EACH one.
 
 Please extract the information as follows:
 - **event_name**: 
   1. Language preference:
-     - If both Chinese and English titles are available, use the Chinese title only.
+     - If both Chinese and English titles are available for the SAME event, prefer Chinese as the primary title.
+     - Exception for film screenings: when the post lists both a Chinese film title and an English title (e.g. 《小偷家族》Shoplifters), include BOTH in event_name — Chinese in 《》, then the English title. This helps readers identify the film; do not drop the English title for films.
      - If only one language is available, use that language (do not translate).
-     - When both CN and EN titles are present in the text, they represent the same event - extract only one title, not two separate events.
+     - When both CN and EN titles are present in the text, they represent the same event - extract only one event entry, not two separate events.
   
   2. CRITICAL - Extract the FULL title:
      - Extract the COMPLETE title as it appears in the post, including all important parts.
@@ -266,12 +276,27 @@ Please extract the information as follows:
   4. Understanding context - CRITICAL: Read the ENTIRE post carefully to find the ACTUAL event name:
      - Read through the ENTIRE text from beginning to end to understand what the actual event is, not just the first sentence or headline.
      - The opening headline is often a promotional hook / call-to-action / marketing tagline and frequently NOT the actual event name.
-     - The actual event name is usually stated more formally later in the post, often with quotation marks (「」) or brackets (【】), and is typically followed by words like "展覽", "活動", "工作坊", "音樂會", etc.
+     - WRONG event_name sources (do NOT use these when formal event titles exist later):
+       * Mission / brand storytelling lines (e.g. "讓城市的樹木，回到城市的家")
+       * Rhetorical questions or narrative intros (e.g. "你是否曾好奇...")
+       * General programme descriptions without a specific dated activity
+       * Programme launch hooks (e.g. "「雞公山下有塊田」活動第一彈") — especially when combined with narrative synopsis paragraphs
+       * Long descriptive sentences about what participants will do, see, or learn (e.g. "走進大江埔的農田，認識在此地耕作的農夫…")
+       * The first 【】 headline when it is thematic/marketing and a later 【】 header names the actual activity
+     - The actual event name is usually stated more formally later in the post, often with quotation marks (「」) or brackets (【】), and is typically followed by words like "展覽", "活動", "工作坊", "開放日", "導覽", "導賞", "走讀", "音樂會", etc.
+     - STRONG SIGNAL: A short standalone title line immediately BEFORE the structured fields (活動日期 / 活動時間 / 集合地點 / 地點 / 收費) is almost always the real event_name — even if it has no 【】 brackets. Examples: "走讀大江埔（一）：農田導賞", "城市原木茶几製作".
+     - PRIORITY: Use the event title from the structured details block — the section that appears together with 📅活動日期 / 日期 / ⏰時間 / 📍地點 / 集合地點 (or equivalent labels). That block defines the real event(s).
     - If the best-looking title candidate contains marketing/CTA wording (e.g., "最後召集", "不容錯過", "把握機會", "倒數", "即將", "即刻報名"), ignore it as the event_name when a separate formal event title exists elsewhere in the post (typically near date/time/venue).
      - Look for the formal event title that appears in the detailed event information section (usually near dates, times, and venue information). This is the actual event name.
     - Promotional/CTA headlines should be treated as marketing, not the event identity.
      - The event might be a course introduction meeting, workshop session, or specific gathering mentioned later in the text.
      - Extract the title of the actual event being promoted, which may differ from the opening hook or promotional text. Always prioritize the formal event name stated in the event details section.
+     - Example (WRONG vs RIGHT):
+       * WRONG: "讓城市的樹木，回到城市的家" (opening mission line — not an event)
+       * RIGHT: "木庫開放日 ＆ 限定工作坊" and "7月1日 開放日限定工作坊" (formal 【】 headers with date/time/venue)
+       * WRONG: "雞公山下有塊田活動第一彈！走進大江埔的農田，認識在此地耕作的農夫" (programme hook + narrative synopsis)
+       * RIGHT: "「雞公山下有塊田」走讀大江埔（一）：農田導賞" (umbrella programme + formal session title from the 活動日期 block)
+       * ALSO ACCEPTABLE: "走讀大江埔（一）：農田導賞" (formal session title alone — preferred over any marketing/narrative text)
   
   5. Including important context:
      - Do not omit important information that describes the nature of the event (e.g., "火苗讀書會130" should not be shortened to just the book title).
@@ -283,18 +308,54 @@ Please extract the information as follows:
      - For example, if the main event is "【動漫「墨」搏】系列第二場展覽 —— 《推演之間》" and there's a later event "延伸活動 —— 藝術家分享會", the second event's title should be "【動漫「墨」搏】系列第二場展覽 —— 《推演之間》延伸活動 —— 藝術家分享會" (including the main event context), NOT just "延伸活動 —— 藝術家分享會".
      - This ensures that each event entry is self-contained and readers understand the full context of what the event is about.
      - Only include the main event context if it's relevant and helps clarify what the later event is about. If events are completely unrelated, do not force this connection.
+
+  6b. CRITICAL - Recurring series / programme with multiple dated sessions (e.g. 週六放映廠, 讀書會系列, 電影節):
+     - If the post header or opening introduces an umbrella programme (e.g. "【JCCAC 週六放映廠】", "XX 系列", "電影節"), EVERY separate dated session listed later MUST include that programme name in event_name.
+     - A bare film title, English title only, or work name alone is WRONG when series context exists in the post.
+     - Each event_name must be SELF-CONTAINED: a reader who only sees the spreadsheet row should understand which programme AND which session/film/work it is.
+     - Preferred format for a film screening inside a series:
+       [Programme name]《中文片名》English Title
+       Examples:
+       * 「JCCAC 週六放映廠」《小偷家族》Shoplifters
+       * 「JCCAC 週六放映廠」《觸得到的奇怪肌膚》Touching the Skin of Eeriness 及《離天堂還很遙遠》Heaven Is Still Far Away
+       * 「JCCAC 週六放映廠」法國電影節 @JCCAC
+     - Include the programme/series name even if it appears only once at the top of the post.
+     - If the session has a special format (映後座談會, 放映座談會, 謝票場), append it after the title when stated for that session (e.g. 「JCCAC 週六放映廠」《三家有本難唸的經》Three Floors（映後座談會）).
+     - Do NOT output only "Shoplifters", "Three Floors", or "Perfect Days" when the post is clearly part of a named series.
+
+  6c. CRITICAL - Open day / visit day + separate workshops in one post:
+     - Many posts open with narrative or mission text, then list one or more formal 【】 event headers with dates/times.
+     - Extract EACH formal event header as its own entry — NOT the opening narrative headline.
+     - When a post has a general open day (導覽, 參觀, 開放日) AND a separately headed workshop section (限定工作坊, 手作工作坊) with its own time and/or fee, create SEPARATE events for each.
+     - Example: Post opens with "【讓城市的樹木，回到城市的家】" (ignore — marketing narrative), then has:
+       * "【木庫開放日 ＆ 限定工作坊】" with 活動日期 7月1日, 12:00-6:00, 導賞 → Event 1: "木庫開放日 ＆ 限定工作坊", date 1/7
+       * "【7月1日 開放日限定工作坊】" at 下午 2:00 with paid options A/B → Event 2: "7月1日 開放日限定工作坊", date 1/7, time 2pm
+     - Sub-options within one workshop (e.g. A. 城市原木茶几製作 / B. 流芯樹頭櫈) are variants of the SAME workshop event — do not split into separate events unless they have different dates or clearly separate sessions.
+     - Never output only the opening mission/tagline when dated 【】 event headers exist below.
+
+  6d. CRITICAL - Programme series episode with formal session title (e.g. 第一彈, （一）, 第二場):
+     - Posts often open with a series/programme name + episode teaser + long narrative, then list a SHORT formal session title on its own line right above 活動日期.
+     - Use the formal session title (the short name of THIS dated session), NOT the opening narrative.
+     - When an umbrella programme name appears at the top (e.g. 「雞公山下有塊田」), prefix it to the session title so the public understands the series context:
+       Format: [Programme name] + [Session title]
+       Example: 「雞公山下有塊田」走讀大江埔（一）：農田導賞
+     - The session title often uses a colon to separate series/location from activity type (走讀大江埔（一）：農田導賞, 導賞：XXX). Preserve this title exactly — do NOT replace it with synopsis text from earlier paragraphs.
+     - event_name must tell a general reader WHAT the event is (activity type + subject), not WHY the organiser is running the programme.
   
   7. For movies, dramas, theater productions, musicals, or similar performing arts events:
-     - Use 《》 (Chinese quotation marks) around the work's name/title.
-     - CRITICAL: For movie screenings with special events (e.g., 映後分享, 謝票場, 周末謝票場, 導演分享), you MUST include both the movie name AND the event type. Simply extracting the movie name alone is insufficient.
-     - Format for movie screenings with special events: 《電影名》+ 活動類型 (e.g., 《地母》映後分享, 《今天應該很高興》周末謝票場)
-     - The event name must clearly indicate what the event is about - a movie name alone does not tell the reader it's a post-screening discussion or special screening event.
+     - Use 《》 (Chinese quotation marks) around the work's name/title when a Chinese title is given.
+     - If the post is part of a named screening series or festival (see 6b), prefix with that programme name before the film title.
+     - CRITICAL: For movie screenings with special events (e.g., 映後分享, 謝票場, 周末謝票場, 導演分享, 映後座談會), you MUST include both the movie name AND the event type. Simply extracting the movie name alone is insufficient.
+     - Format for movie screenings with special events: [Programme if any]《電影名》+ 活動類型 (e.g., 「JCCAC 週六放映廠」《地母》映後分享, 《今天應該很高興》周末謝票場)
+     - The event name must clearly indicate what the event is about - a movie name alone does not tell the reader it's a post-screening discussion, which film in a series, or special screening event.
      - If available, include the activity type (e.g., 原創粵語音樂劇, 詩歌音樂劇場作品) before the title for theater/drama productions.
      - If the title itself is not self-explanatory (e.g., just 《劇名》), include the nature of the performance (e.g., 音樂劇, 舞台劇) after the title if such information is available in the text.
      - Format examples: 
+       * 「JCCAC 週六放映廠」《小偷家族》Shoplifters
+       * 「JCCAC 週六放映廠」《觸得到的奇怪肌膚》Touching the Skin of Eeriness 及《離天堂還很遙遠》Heaven Is Still Far Away（映後座談會）
        * 原創粵語音樂劇《一束光——高錕的記憶》
        * 《異曲同夢》音樂劇 (when 音樂劇 is mentioned in the text)
-       * 《地母》映後分享 (movie screening with post-screening discussion)
+       * 《地母》映後分享 (only when there is NO umbrella programme name in the post)
        * 《今天應該很高興》周末謝票場 (movie screening with special thank-you session)
        * 《劇名》 (when no additional context is available)
      - Do not make up activity types if they're not mentioned in the text.
@@ -303,6 +364,8 @@ Please extract the information as follows:
 
 - **date**: CRITICAL - You MUST output dates ONLY in D/M format (day/month, no leading zeros, no year).
   - CRITICAL: DO NOT INVENT OR GUESS DATES. Only extract dates that are EXPLICITLY mentioned in the post text. If no date is mentioned anywhere in the post, you MUST output "N/A". Never make up dates based on assumptions, context clues, patterns, or the post date. If the post does not contain a specific date, time, or date range, the date field must be "N/A".
+  - PRIORITY for event dates: Look for explicit event-date labels first — 公演日期, 演出日期, 展期, 活動日期, 日期, 📅, 舉行日期, 開放日期 — in the structured event details section. These ALWAYS override the post date. Do NOT use 預售期 or 報名日期 as the event date when 公演日期 / 展期 is also stated.
+  - ABSOLUTELY FORBIDDEN: Using the Instagram POST DATE as the event date when the post body states a different 活動日期. Example: post published 26/6, body says "活動日期：2026年7月1日" → extract 1/7, NOT 26/6.
   - ABSOLUTELY FORBIDDEN: Do NOT infer dates from vague temporal references. For example:
     * If the post says "一連三日" (three consecutive days) but does NOT specify which dates, output "N/A". Do NOT guess dates like "14-16/2" based on the post date.
     * If the post says "將舉行" (will be held) or "即將舉行" (will be held soon) without specific dates, output "N/A".
@@ -318,6 +381,18 @@ Please extract the information as follows:
   - For a single date: D/M format ONLY (e.g., 1/2 for February 1, NOT 01/02; 12/3 for March 12, NOT 12/03)
   - For multiple dates: D/M, D/M, D/M format ONLY (comma-separated, e.g., 6/2, 7/2 for February 6 and February 7)
   - For a date range: D/M-D/M format ONLY (e.g., 1/2-5/2 for February 1 to February 5, or 12/3-15/3 for March 12 to March 15)
+  - CRITICAL - Extract the FULL date range, not just the start date:
+    * When the post states a from-to run (公演日期, 展期, 活動日期, 即日起至, X至Y, X - Y), you MUST output BOTH start AND end as D/M-D/M.
+    * WRONG: "21/8" when the post says "21 - 30/8/2026" or "公演日期｜21 - 30/8/2026"
+    * RIGHT: "21/8-30/8"
+    * Abbreviated range formats (very common in HK posts) — the month/day after the dash applies to BOTH ends when only written once:
+      - "21 - 30/8/2026" or "21-30/8" → 21/8-30/8 (August 21 to August 30)
+      - "1 - 5/2" → 1/2-5/2 (February 1 to February 5)
+      - "17/4 - 30/6" → 17/4-30/6 (April 17 to June 30)
+    * If start and end share the same month, still output both full D/M endpoints (e.g. 21/8-30/8, NOT 21/8).
+  - CRITICAL - Performance / exhibition run dates vs other date mentions:
+    * For a specific play, show, or exhibition, use 公演日期 / 演出日期 / 展期 / 展覽日期 as the event date — NOT 預售期, 報名日期, or promotional periods unless those are the only dates and no performance dates exist.
+    * Example: Play with "公演日期｜21 - 30/8/2026" and separate "預售期(17/4 - 30/6)" → event date is 21/8-30/8 (the performance run), NOT 17/4-30/6 (presale window).
   - If NO date is mentioned: Output "N/A" (do NOT guess, estimate, or infer dates from other information)
   - ABSOLUTELY NO leading zeros: Use 1/2 (NOT 01/02), 5/2 (NOT 05/02), 6/2 (NOT 06/02), 9/11 (NOT 09/11)
   - ABSOLUTELY NO year in the output: Extract only day and month, never include the year
@@ -337,8 +412,10 @@ Please extract the information as follows:
     * In ALL other cases, COMPLETELY IGNORE the post date. Do NOT use it as the event date.
     * If event dates are clearly stated in the post (e.g., "日期：2月14日", "2月4日", "February 4", "4/2"), extract those dates EXACTLY as stated. The post date is IRRELEVANT.
     * Example: If post date is 11/2 but the post says "日期：2月14日（六）、2月15日（日）", extract "14/2, 15/2" (the event dates), NOT "11/2" (the post date). The post date should be completely ignored in this case.
+    * Example: If post date is 26/6 but the post says "活動日期：2026年7月1日", extract "1/7" (July 1 event date), NOT "26/6" (post date).
   - When interpreting dates in the post: Unless the post explicitly specifies otherwise, assume ALL dates mentioned in the post are in UK date format (day/month/year). For example, if the post shows "12.3.2026" or "12/3/2026", interpret this as March 12, 2026 (UK format: DD.MM.YYYY or DD/MM/YYYY), NOT December 3. Extract only as 12/3 (without the year).
   - REMINDER: Output format is ALWAYS D/M (single digit day/month without leading zeros, no year) for ALL cases: single dates, date ranges, and multiple dates. DO NOT MISS ANY DATES mentioned in the post, but also DO NOT INVENT dates that are not mentioned.
+  - REMINDER: A stated date RANGE is one field value (e.g. 21/8-30/8). Never truncate a range to only its first day.
 - **time**: Provide the time in the format of 8am-10pm ONLY if explicitly mentioned in the post. If no time is mentioned, output 'N/A'. Do NOT invent or guess times.
 - **venue**: State the venue ONLY if explicitly mentioned in the details. If no venue is mentioned, output 'N/A'. Do NOT invent or guess venues.
 - **cost**: State the cost ONLY if explicitly mentioned in the details. If free is explicitly stated, output 'Free'. If no cost information is mentioned, output 'N/A'. Do NOT invent or guess costs. If available, use the follow format:

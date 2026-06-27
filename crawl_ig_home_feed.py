@@ -38,6 +38,7 @@ from crawl_ig_saved_posts import (
     append_processed_link,
     build_event_info,
     create_driver,
+    dismiss_instagram_popups,
     extract_photo,
     extract_username_and_details,
     get_content_sync,
@@ -93,25 +94,35 @@ def read_links_file(path):
     return urls
 
 
-def dismiss_instagram_popups(driver):
-    for text in ("Not Now", "Not now", "Later"):
-        try:
-            buttons = driver.find_elements(
-                By.XPATH,
-                f"//button[contains(., '{text}')]|//div[@role='button'][contains(., '{text}')]",
-            )
-            for btn in buttons:
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(1)
-                    break
-        except Exception:
-            pass
+def scroll_feed_page(driver):
+    """Scroll the home feed (main column + window) so lazy-loaded posts appear."""
+    dismiss_instagram_popups(driver)
+    driver.execute_script(
+        """
+        const step = Math.max(window.innerHeight * 0.85, 600);
+        const targets = [
+            document.querySelector('main'),
+            document.scrollingElement,
+            document.documentElement,
+            document.body,
+        ].filter(Boolean);
+        for (const el of targets) {
+            const h = el.scrollHeight || 0;
+            const c = el.clientHeight || 0;
+            if (h > c + 50) {
+                el.scrollTop = h;
+            }
+        }
+        window.scrollBy(0, step);
+        """
+    )
 
 
 def go_to_home_feed(driver):
     safe_driver_get(driver, INSTAGRAM_HOME, wait_after=3)
-    dismiss_instagram_popups(driver)
+    for _ in range(3):
+        dismiss_instagram_popups(driver)
+        time.sleep(1)
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     for selector in [
         (By.TAG_NAME, "article"),
@@ -162,8 +173,13 @@ def extract_feed_post_links(driver, scroll_pause=3, max_scrolls=20):
             if links:
                 break
 
-    for _ in range(max_scrolls):
+    collect_from_page()
+    if not links:
+        time.sleep(5)
+        dismiss_instagram_popups(driver)
         collect_from_page()
+
+    for scroll_i in range(max_scrolls):
         if len(links) == last_count:
             no_new_count += 1
             if no_new_count >= 3:
@@ -171,8 +187,18 @@ def extract_feed_post_links(driver, scroll_pause=3, max_scrolls=20):
         else:
             no_new_count = 0
         last_count = len(links)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        scroll_feed_page(driver)
         time.sleep(scroll_pause)
+        dismiss_instagram_popups(driver, rounds=1)
+        collect_from_page()
+        if scroll_i > 0 and scroll_i % 5 == 0:
+            print(f"  ... {len(links)} post link(s) after {scroll_i + 1} scroll(s)")
+
+    if len(links) < 5:
+        print(
+            f"[WARN] Only {len(links)} post link(s) collected — feed may not have scrolled. "
+            "Try --no-headless and dismiss any notification/login popups manually, then re-run."
+        )
 
     return filter_post_urls(links)
 

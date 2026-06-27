@@ -47,6 +47,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
@@ -568,19 +569,75 @@ def switch_to_account(driver, target_username):
     return True
 
 
-def dismiss_instagram_popups(driver):
-    for text in ("Not Now", "Not now", "Later"):
+_DISMISS_BUTTON_TEXTS = (
+    "Not Now",
+    "Not now",
+    "Later",
+    "No thanks",
+    "Maybe Later",
+    "Decline",
+    "Cancel",
+    "Skip",
+    "稍後再說",
+    "暫時不要",
+    "稍後",
+    "以後再說",
+    "不用了",
+    "取消",
+    "跳過",
+)
+
+
+def dismiss_instagram_popups(driver, rounds=3):
+    """Dismiss Instagram overlays (notifications, save-login, cookies, etc.)."""
+    for _ in range(rounds):
+        dismissed = False
         try:
-            for btn in driver.find_elements(
-                By.XPATH,
-                f"//button[contains(., '{text}')]|//div[@role='button'][contains(., '{text}')]",
-            ):
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(1)
-                    break
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(0.3)
         except Exception:
             pass
+
+        for text in _DISMISS_BUTTON_TEXTS:
+            try:
+                xpath = (
+                    f"//button[contains(normalize-space(.), '{text}')]"
+                    f"|//div[@role='button'][contains(normalize-space(.), '{text}')]"
+                    f"|//span[contains(normalize-space(.), '{text}')]/ancestor::button[1]"
+                    f"|//span[contains(normalize-space(.), '{text}')]/ancestor::div[@role='button'][1]"
+                )
+                for btn in driver.find_elements(By.XPATH, xpath):
+                    if btn.is_displayed():
+                        btn.click()
+                        time.sleep(0.8)
+                        dismissed = True
+                        break
+            except Exception:
+                pass
+            if dismissed:
+                break
+
+        if not dismissed:
+            for label in ("Close", "關閉", "Dismiss"):
+                try:
+                    for btn in driver.find_elements(
+                        By.XPATH,
+                        f"//button[@aria-label='{label}']"
+                        f"|//div[@role='button'][@aria-label='{label}']",
+                    ):
+                        if btn.is_displayed():
+                            btn.click()
+                            time.sleep(0.8)
+                            dismissed = True
+                            break
+                except Exception:
+                    pass
+                if dismissed:
+                    break
+
+        if not dismissed:
+            break
+        time.sleep(0.5)
 
 
 def go_to_saved_posts_grid(driver, username, url=None):
