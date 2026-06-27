@@ -43,6 +43,7 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -295,8 +296,7 @@ def get_content_sync(url, driver=None):
     """Fetch post HTML. Prefer logged-in Selenium driver; fallback to requests + cookies.pkl."""
     if driver is not None:
         try:
-            driver.get(url)
-            time.sleep(1.5)
+            safe_driver_get(driver, url, wait_after=1.5)
             return BeautifulSoup(driver.page_source, "html.parser")
         except Exception as e:
             print(f"  [WARN] selenium fetch failed {url}: {e}")
@@ -413,6 +413,25 @@ def build_event_info(username, response, tags, category, url, photo_url=None):
     return events
 
 
+def configure_driver(driver, page_load_timeout=45):
+    driver.set_page_load_timeout(page_load_timeout)
+    driver.set_script_timeout(30)
+
+
+def safe_driver_get(driver, url, wait_after=1.5):
+    """Navigate with timeout; stop loading if Instagram hangs."""
+    try:
+        driver.get(url)
+    except TimeoutException:
+        print(f"[WARN] Page load timeout for {url}; stopping load and continuing.")
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+    if wait_after:
+        time.sleep(wait_after)
+
+
 def create_driver(headless=True):
     if not headless and not os.environ.get("DISPLAY"):
         print(
@@ -427,6 +446,7 @@ def create_driver(headless=True):
         sys.exit(1)
 
     options = Options()
+    options.page_load_strategy = "eager"
     if headless:
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -439,12 +459,12 @@ def create_driver(headless=True):
         service=Service(ChromeDriverManager().install()),
         options=options,
     )
+    configure_driver(driver)
     return driver
 
 
 def load_cookies(driver):
-    driver.get(INSTAGRAM_HOME)
-    time.sleep(2)
+    safe_driver_get(driver, INSTAGRAM_HOME, wait_after=2)
     if not os.path.exists(COOKIES_FILE):
         return False
     try:

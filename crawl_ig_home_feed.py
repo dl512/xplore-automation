@@ -45,6 +45,7 @@ from crawl_ig_saved_posts import (
     load_cookies,
     load_processed_links,
     normalize_post_url,
+    safe_driver_get,
     save_cookies,
     switch_to_account,
     write_event_to_sheet,
@@ -109,8 +110,7 @@ def dismiss_instagram_popups(driver):
 
 
 def go_to_home_feed(driver):
-    driver.get(INSTAGRAM_HOME)
-    time.sleep(4)
+    safe_driver_get(driver, INSTAGRAM_HOME, wait_after=3)
     dismiss_instagram_popups(driver)
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     for selector in [
@@ -194,6 +194,7 @@ def process_links_for_events(
     current_row,
     tracker_path=None,
     processed_urls=None,
+    driver=None,
 ):
     """For each URL: tracker skip, is_event check, extract, write to Google Sheet."""
     session_history = []
@@ -214,7 +215,7 @@ def process_links_for_events(
         if i > 0:
             time.sleep(DELAY_BETWEEN_POSTS)
 
-        soup = get_content_sync(url)
+        soup = get_content_sync(url, driver=driver)
         if not soup:
             print(f"  [skip] fetch failed: {url[:70]}")
             continue
@@ -323,6 +324,7 @@ def main():
     args = parser.parse_args()
 
     links = []
+    driver = None
 
     if args.links_file:
         if not os.path.isfile(args.links_file):
@@ -336,7 +338,7 @@ def main():
         driver = create_driver(headless=headless)
         try:
             if args.save_cookies:
-                driver.get(INSTAGRAM_HOME)
+                safe_driver_get(driver, INSTAGRAM_HOME, wait_after=0)
                 print(
                     "Log in in the browser, wait for the home feed, then press Enter to save cookies.pkl."
                 )
@@ -347,11 +349,6 @@ def main():
             if not load_cookies(driver):
                 print(f"No {COOKIES_FILE} found. Run with --save-cookies first.")
                 return
-
-            driver.get(INSTAGRAM_HOME)
-            time.sleep(2)
-            driver.refresh()
-            time.sleep(2)
 
             if args.switch_account:
                 if not switch_to_account(driver, args.switch_account):
@@ -371,56 +368,79 @@ def main():
                 scroll_pause=args.scroll_pause,
                 max_scrolls=args.max_scrolls,
             )
-        finally:
+            keep_driver = not args.no_extract and bool(links)
+            if not keep_driver:
+                driver.quit()
+                driver = None
+        except Exception as e:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+            print(f"[ERROR] Browser crawl failed: {e}")
+            print("Tip: close stray Chrome windows, or run with --no-headless on your PC.")
+            return
+
+    try:
+        print(f"\n{len(links)} post URL(s):\n")
+        for u in links:
+            print(u)
+
+        if args.output:
+            out_path = os.path.abspath(args.output)
+            with open(out_path, "w", encoding="utf-8") as f:
+                for u in links:
+                    f.write(u + "\n")
+            print(f"\nWrote {len(links)} URL(s) to {out_path}")
+
+        if args.no_extract or not links:
+            return
+
+        print("\nChecking events and writing to Google Sheet...")
+        print(
+            f"  [LLM] primary: {', '.join(_primary_models_from_env())} "
+            f"-> fallback: {_fallback_model_from_env()}"
+        )
+
+        sheet, current_row = init_google_sheets()
+        if sheet is None:
+            print("[WARN] Google Sheet not available; extraction runs but rows are not saved.")
+
+        tracker_path = None
+        processed_urls = set()
+        if not args.no_tracker:
+            tracker_path = os.path.abspath(args.tracker)
+            processed_urls = load_processed_links(tracker_path)
+            if processed_urls:
+                print(f"  Tracker: {len(processed_urls)} URL(s) in {tracker_path}")
+
+        to_process = [
+            u for u in links if normalize_post_url(u) not in processed_urls
+        ] if tracker_path else links
+        if tracker_path and len(to_process) < len(links):
+            print(f"  Processing {len(to_process)} new URL(s) ({len(links) - len(to_process)} already in tracker).")
+
+        stats = process_links_for_events(
+            to_process,
+            sheet,
+            current_row,
+            tracker_path=tracker_path,
+            processed_urls=processed_urls,
+            driver=driver,
+        )
+        print(
+            f"\nDone. Wrote {stats['written']} event row(s). "
+            f"Skipped: {stats['skipped_tracker']} tracker, "
+            f"{stats['skipped_not_event']} not events."
+        )
+    finally:
+        if driver is not None:
             try:
                 driver.quit()
             except Exception:
                 pass
-
-    print(f"\n{len(links)} post URL(s):\n")
-    for u in links:
-        print(u)
-
-    if args.output:
-        out_path = os.path.abspath(args.output)
-        with open(out_path, "w", encoding="utf-8") as f:
-            for u in links:
-                f.write(u + "\n")
-        print(f"\nWrote {len(links)} URL(s) to {out_path}")
-
-    if args.no_extract or not links:
-        return
-
-    print("\nChecking events and writing to Google Sheet...")
-    print(
-        f"  [LLM] primary: {', '.join(_primary_models_from_env())} "
-        f"-> fallback: {_fallback_model_from_env()}"
-    )
-
-    sheet, current_row = init_google_sheets()
-    if sheet is None:
-        print("[WARN] Google Sheet not available; extraction runs but rows are not saved.")
-
-    tracker_path = None
-    processed_urls = set()
-    if not args.no_tracker:
-        tracker_path = os.path.abspath(args.tracker)
-        processed_urls = load_processed_links(tracker_path)
-        if processed_urls:
-            print(f"  Tracker: {len(processed_urls)} URL(s) in {tracker_path}")
-
-    stats = process_links_for_events(
-        links,
-        sheet,
-        current_row,
-        tracker_path=tracker_path,
-        processed_urls=processed_urls,
-    )
-    print(
-        f"\nDone. Wrote {stats['written']} event row(s). "
-        f"Skipped: {stats['skipped_tracker']} tracker, "
-        f"{stats['skipped_not_event']} not events."
-    )
 
 
 if __name__ == "__main__":
