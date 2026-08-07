@@ -27,6 +27,22 @@ import os
 import re
 import json
 
+
+def sheet_beginning_date_formula(row: int) -> str:
+    """Google Sheets formula for Beginning Date (col I) from Date text in col H."""
+    return (
+        f'=DATEVALUE(IF(NOT(ISERROR(FIND(",",H{row}))),'
+        f'LEFT(H{row},(FIND(",",H{row}))-1),'
+        f'IF(NOT(ISERROR(FIND("-",H{row}))),'
+        f'LEFT(H{row},(FIND("-",H{row}))-1),H{row})))'
+    )
+
+
+def sheet_available_formula(row: int) -> str:
+    """Google Sheets formula for Available (col A) from Beginning Date in col I."""
+    return f'=IF(I{row}<TODAY(),"N","Y")'
+
+
 # Tags and categories
 TAGS_LIST = [
     "展覽", "讀書會", "文學", "哲學", "導賞團", "歷史", "社區", "文化", "世界",

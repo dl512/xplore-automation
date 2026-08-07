@@ -33,6 +33,8 @@ load_dotenv(override=True)
 from crawl_ig_saved_posts import (
     COOKIES_FILE,
     DELAY_BETWEEN_POSTS,
+    EVENT_SHEET_TAB,
+    INPUT_SHEET_TAB,
     INSTAGRAM_HOME,
     WAIT_TIMEOUT,
     append_processed_link,
@@ -42,14 +44,14 @@ from crawl_ig_saved_posts import (
     extract_photo,
     extract_username_and_details,
     get_content_sync,
-    init_google_sheets,
+    init_input_and_event_sheets,
     load_cookies,
     load_processed_links,
     normalize_post_url,
     safe_driver_get,
     save_cookies,
     switch_to_account,
-    write_event_to_sheet,
+    write_event_routed,
 )
 from extraction_details import (
     _fallback_model_from_env,
@@ -216,15 +218,18 @@ def _is_event_yes(result):
 
 def process_links_for_events(
     links,
-    sheet,
-    current_row,
+    input_sheet,
+    input_row,
+    event_sheet,
+    event_row,
     tracker_path=None,
     processed_urls=None,
     driver=None,
 ):
-    """For each URL: tracker skip, is_event check, extract, write to Google Sheet."""
+    """For each URL: tracker skip, is_event check, extract, route to Event or input."""
     session_history = []
-    written_total = 0
+    written_event = 0
+    written_input = 0
     skipped_not_event = 0
     skipped_tracker = 0
 
@@ -277,20 +282,35 @@ def process_links_for_events(
         )
 
         for event in event_list:
-            key_fields = ["Event name", "Date", "Time", "Location"]
-            if not any(
-                event.get(f) and str(event.get(f)).strip() for f in key_fields
-            ):
-                continue
-            if sheet is not None:
-                try:
-                    sheet, current_row = write_event_to_sheet(
-                        sheet, current_row, event
+            try:
+                (
+                    input_sheet,
+                    input_row,
+                    event_sheet,
+                    event_row,
+                    dest,
+                ) = write_event_routed(
+                    event,
+                    input_sheet,
+                    input_row,
+                    event_sheet,
+                    event_row,
+                )
+                if dest == EVENT_SHEET_TAB:
+                    written_event += 1
+                elif dest and (
+                    dest == INPUT_SHEET_TAB or dest.startswith(INPUT_SHEET_TAB)
+                ):
+                    written_input += 1
+                if dest:
+                    print(
+                        f"    -> {dest}: "
+                        f"{event.get('Event name', '')!r} / "
+                        f"{event.get('Date', '')!r}"
                     )
-                    written_total += 1
-                except Exception as e:
-                    print(f"  [WARN] write failed: {e}")
-                    continue
+            except Exception as e:
+                print(f"  [WARN] write failed: {e}")
+                continue
             session_history.append(
                 f"Event name: {event.get('Event name', '')}, "
                 f"Date: {event.get('Date', '')}, "
@@ -298,15 +318,20 @@ def process_links_for_events(
                 f"Location: {event.get('Location', '')}"
             )
 
+        # Always mark URL processed so daily runs do not re-extract the same post
         if tracker_path:
             append_processed_link(tracker_path, norm, processed_urls)
 
     return {
-        "written": written_total,
+        "written_event": written_event,
+        "written_input": written_input,
+        "written": written_event + written_input,
         "skipped_not_event": skipped_not_event,
         "skipped_tracker": skipped_tracker,
-        "sheet": sheet,
-        "current_row": current_row,
+        "input_sheet": input_sheet,
+        "input_row": input_row,
+        "event_sheet": event_sheet,
+        "event_row": event_row,
     }
 
 
@@ -430,9 +455,16 @@ def main():
             f"-> fallback: {_fallback_model_from_env()}"
         )
 
-        sheet, current_row = init_google_sheets()
-        if sheet is None:
-            print("[WARN] Google Sheet not available; extraction runs but rows are not saved.")
+        input_sheet, input_row, event_sheet, event_row = init_input_and_event_sheets()
+        if input_sheet is None and event_sheet is None:
+            print(
+                "[WARN] Google Sheet not available; extraction runs but rows are not saved."
+            )
+        else:
+            print(
+                f"  Route: complete -> {EVENT_SHEET_TAB}; "
+                f"N/A name/date -> {INPUT_SHEET_TAB}"
+            )
 
         tracker_path = None
         processed_urls = set()
@@ -450,14 +482,17 @@ def main():
 
         stats = process_links_for_events(
             to_process,
-            sheet,
-            current_row,
+            input_sheet,
+            input_row,
+            event_sheet,
+            event_row,
             tracker_path=tracker_path,
             processed_urls=processed_urls,
             driver=driver,
         )
         print(
-            f"\nDone. Wrote {stats['written']} event row(s). "
+            f"\nDone. Wrote {stats['written_event']} to {EVENT_SHEET_TAB}, "
+            f"{stats['written_input']} to {INPUT_SHEET_TAB}. "
             f"Skipped: {stats['skipped_tracker']} tracker, "
             f"{stats['skipped_not_event']} not events."
         )

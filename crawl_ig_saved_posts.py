@@ -11,7 +11,8 @@ Usage:
   # Then scp cookies.pkl to servers without a GUI.
   python crawl_ig_saved_posts.py --save-cookies
 
-  # Crawl saved posts, extract event info from each post, append to Google Sheet (input tab).
+  # Crawl saved posts, extract event info from each post.
+  # Complete events (name+date) go to Event(new); N/A name/date stay on input for review.
   # Skips URLs in processed_ig_links.txt (default); appends each URL after it is processed.
   python crawl_ig_saved_posts.py
 
@@ -24,7 +25,7 @@ Usage:
   # If you log in as primary but want saved posts for xplore.hk:
   python crawl_ig_saved_posts.py --switch-account xplore.hk --username xplore.hk
 
-  LLM: tries GPT models (gpt-4.1-nano, gpt-4o-mini, gpt-3.5-turbo) in order; if each
+  LLM: tries GPT models (gpt-5-mini, gpt-4o-mini, gpt-3.5-turbo) in order; if each
   call errors or returns blank event fields, falls back to google/gemma-2-9b-it.
   Override with LLM_PRIMARY_MODELS=id1,id2 and LLM_FALLBACK_MODEL=id (optional).
 """
@@ -58,6 +59,8 @@ from extraction_details import (
     extract_info_with_model_fallback,
     _primary_models_from_env,
     _fallback_model_from_env,
+    sheet_available_formula,
+    sheet_beginning_date_formula,
 )
 
 # Google Sheet + GCS (standalone: set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS)
@@ -77,6 +80,8 @@ except ImportError:
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1G_8RMWjf0T9sNdMxKYy_Fc051I6zhdLLy6ehLak4CX4")
 GOOGLE_CLOUD_CREDENTIALS = None
+INPUT_SHEET_TAB = os.getenv("GOOGLE_INPUT_SHEET_TAB", "input")
+EVENT_SHEET_TAB = os.getenv("GOOGLE_EVENT_SHEET_TAB", "Event(new)")
 
 try:
     from xplore_automation import GOOGLE_CLOUD_CREDENTIALS as _X_CREDS, GOOGLE_SHEET_ID as _X_SID
@@ -213,14 +218,58 @@ def manage_photo(image_url):
         return ""
 
 
-def extract_photo(url):
-    """Get post image via Instaloader, upload to GCS. Returns '' on failure (does not block sheet write)."""
+def instagram_media_url(url):
+    """Direct JPEG URL for a post/reel shortcode (works without GraphQL login)."""
     shortcode = extract_shortcode_from_url(url)
     if not shortcode:
         return ""
+    return f"https://www.instagram.com/p/{shortcode}/media/?size=l"
+
+
+def extract_og_image_url(url, driver=None):
+    """Parse og:image / twitter:image from post HTML (requests+cookies or Selenium)."""
+    soup = get_content_sync(url, driver=driver)
+    if not soup:
+        return ""
+    for attrs in (
+        {"property": "og:image"},
+        {"name": "twitter:image"},
+        {"property": "twitter:image"},
+    ):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    return ""
+
+
+def extract_photo(url, driver=None):
+    """Get post image: public media URL, og:image, then Instaloader; upload to GCS."""
+    shortcode = extract_shortcode_from_url(url)
+    if not shortcode:
+        return ""
+
+    uploaded = manage_photo(instagram_media_url(url))
+    if uploaded:
+        return uploaded
+
+    image_url = extract_og_image_url(url, driver=driver)
+    if image_url:
+        uploaded = manage_photo(image_url)
+        if uploaded:
+            return uploaded
+
     try:
         import instaloader
-        L = instaloader.Instaloader()
+
+        L = instaloader.Instaloader(
+            quiet=True,
+            download_pictures=False,
+            download_videos=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            max_connection_attempts=1,
+        )
         _load_instaloader_session(L)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         if post.url:
@@ -333,8 +382,12 @@ def extract_username_and_details(soup):
     return "", "", None
 
 
-def init_google_sheets():
-    """Initialize Google Sheets client and open the 'input' worksheet. Returns (sheet, current_row) or (None, None)."""
+def init_google_sheets(tab_name=None):
+    """
+    Open a worksheet and find the first empty row.
+    Default tab: input. Returns (sheet, current_row) or (None, None).
+    """
+    tab = tab_name or INPUT_SHEET_TAB
     if not _SHEETS_AVAILABLE or not GOOGLE_CLOUD_CREDENTIALS:
         return None, None
     try:
@@ -346,30 +399,62 @@ def init_google_sheets():
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
         try:
             names = [ws.title for ws in spreadsheet.worksheets()]
-            sheet = spreadsheet.worksheet("input") if "input" in names else spreadsheet.sheet1
+            if tab in names:
+                sheet = spreadsheet.worksheet(tab)
+            elif tab == INPUT_SHEET_TAB and "input" in names:
+                sheet = spreadsheet.worksheet("input")
+            else:
+                print(f"[WARN] Worksheet {tab!r} not found; tabs={names}")
+                return None, None
         except Exception:
-            sheet = spreadsheet.sheet1
+            return None, None
         row = find_first_empty_row(sheet)
         return sheet, row
     except Exception as e:
-        print(f"[WARN] Google Sheets init failed: {e}")
+        print(f"[WARN] Google Sheets init failed ({tab}): {e}")
         return None, None
 
 
+def init_input_and_event_sheets():
+    """Open input + Event tabs for routing. Returns (input_sheet, input_row, event_sheet, event_row)."""
+    input_sheet, input_row = init_google_sheets(INPUT_SHEET_TAB)
+    event_sheet, event_row = init_google_sheets(EVENT_SHEET_TAB)
+    return input_sheet, input_row, event_sheet, event_row
+
+
 def find_first_empty_row(sheet):
+    """Next append row = one past the last non-empty Event name (col C)."""
     try:
-        col = sheet.col_values(1)
-        for i in range(2, len(col) + 2):
-            if i > len(col) or not col[i - 1]:
-                return i
-        return len(col) + 1
+        col = sheet.col_values(3)  # Event name
+        if not col or len(col) <= 1:
+            col = sheet.col_values(1)  # Available fallback
+        last = 1  # header
+        for i, val in enumerate(col, start=1):
+            if i == 1:
+                continue
+            if str(val).strip():
+                last = i
+        return last + 1
     except Exception:
         return 2
 
 
+def _is_na_field(value) -> bool:
+    s = str(value or "").strip().upper()
+    return s in {"", "N/A", "NA", "NONE", "NULL"}
+
+
+def needs_manual_review(event_dict) -> bool:
+    """True if Event name or Date is missing/N/A — keep on input for fact-check."""
+    return _is_na_field(event_dict.get("Event name")) or _is_na_field(
+        event_dict.get("Date")
+    )
+
+
 def write_event_to_sheet(sheet, current_row, event_dict):
+    r = current_row
     row_data = [
-        event_dict.get("Available", ""),
+        sheet_available_formula(r),
         event_dict.get("Cost", ""),
         event_dict.get("Event name", ""),
         event_dict.get("Category", ""),
@@ -377,7 +462,7 @@ def write_event_to_sheet(sheet, current_row, event_dict):
         event_dict.get("Organizer", ""),
         event_dict.get("Link", ""),
         event_dict.get("Date", ""),
-        event_dict.get("placeholder1", ""),
+        sheet_beginning_date_formula(r),
         event_dict.get("placeholder2", ""),
         event_dict.get("Time", ""),
         event_dict.get("Location", ""),
@@ -385,8 +470,50 @@ def write_event_to_sheet(sheet, current_row, event_dict):
         event_dict.get("Area", ""),
         event_dict.get("code", ""),
     ]
-    sheet.update(f"A{current_row}:O{current_row}", [row_data])
+    sheet.update(
+        f"A{r}:O{r}",
+        [row_data],
+        value_input_option="USER_ENTERED",
+    )
     return sheet, current_row + 1
+
+
+def write_event_routed(
+    event_dict,
+    input_sheet,
+    input_row,
+    event_sheet,
+    event_row,
+):
+    """
+    Route: N/A name/date -> input (manual check); else -> Event(new).
+    Returns (input_sheet, input_row, event_sheet, event_row, dest_label|None).
+    """
+    key_fields = ["Event name", "Date", "Time", "Location"]
+    if not any(
+        event_dict.get(f) and str(event_dict.get(f)).strip() for f in key_fields
+    ):
+        return input_sheet, input_row, event_sheet, event_row, None
+
+    if needs_manual_review(event_dict):
+        if input_sheet is None:
+            return input_sheet, input_row, event_sheet, event_row, None
+        input_sheet, input_row = write_event_to_sheet(
+            input_sheet, input_row, event_dict
+        )
+        return input_sheet, input_row, event_sheet, event_row, INPUT_SHEET_TAB
+
+    if event_sheet is None:
+        # Fallback to input if Event tab unavailable
+        if input_sheet is None:
+            return input_sheet, input_row, event_sheet, event_row, None
+        input_sheet, input_row = write_event_to_sheet(
+            input_sheet, input_row, event_dict
+        )
+        return input_sheet, input_row, event_sheet, event_row, f"{INPUT_SHEET_TAB}(fallback)"
+
+    event_sheet, event_row = write_event_to_sheet(event_sheet, event_row, event_dict)
+    return input_sheet, input_row, event_sheet, event_row, EVENT_SHEET_TAB
 
 
 def build_event_info(username, response, tags, category, url, photo_url=None):
@@ -877,10 +1004,26 @@ def main():
             )
             if tracker_path:
                 print(f"  Tracker: {len(processed_urls)} URL(s) in {tracker_path}")
-            sheet, current_row = init_google_sheets()
-            if sheet is None:
-                print("[WARN] Google Sheet not available; extraction runs but rows are not saved.")
-            written_total = 0
+            input_sheet, input_row, event_sheet, event_row = (
+                init_input_and_event_sheets()
+            )
+            if input_sheet is None and event_sheet is None:
+                print(
+                    "[WARN] Google Sheet not available; extraction runs but rows are not saved."
+                )
+            else:
+                print(
+                    f"  Sheets: {INPUT_SHEET_TAB}="
+                    f"{'ok@'+str(input_row) if input_sheet else 'missing'}, "
+                    f"{EVENT_SHEET_TAB}="
+                    f"{'ok@'+str(event_row) if event_sheet else 'missing'}"
+                )
+                print(
+                    "  Route: complete events -> "
+                    f"{EVENT_SHEET_TAB}; N/A name/date -> {INPUT_SHEET_TAB}"
+                )
+            written_input = 0
+            written_event = 0
             skipped_tracker = 0
             to_process = new_links if tracker_path else links
             for i, url in enumerate(to_process):
@@ -905,27 +1048,48 @@ def main():
                 event_list = build_event_info(
                     username, response, tags, category, url, photo_url=photo_url
                 )
-                if sheet is not None:
-                    for event_dict in event_list:
-                        key_fields = ["Event name", "Date", "Time", "Location"]
-                        if not any(
-                            event_dict.get(f) and str(event_dict.get(f)).strip()
-                            for f in key_fields
+                for event_dict in event_list:
+                    try:
+                        (
+                            input_sheet,
+                            input_row,
+                            event_sheet,
+                            event_row,
+                            dest,
+                        ) = write_event_routed(
+                            event_dict,
+                            input_sheet,
+                            input_row,
+                            event_sheet,
+                            event_row,
+                        )
+                        if dest == INPUT_SHEET_TAB or (
+                            dest and dest.startswith(INPUT_SHEET_TAB)
                         ):
-                            continue
-                        try:
-                            sheet, current_row = write_event_to_sheet(
-                                sheet, current_row, event_dict
+                            written_input += 1
+                            print(
+                                f"    -> {dest}: "
+                                f"{event_dict.get('Event name', '')!r} / "
+                                f"{event_dict.get('Date', '')!r}"
                             )
-                            written_total += 1
-                        except Exception as e:
-                            print(f"  [WARN] write failed: {e}")
+                        elif dest == EVENT_SHEET_TAB:
+                            written_event += 1
+                            print(
+                                f"    -> {dest}: "
+                                f"{event_dict.get('Event name', '')!r} / "
+                                f"{event_dict.get('Date', '')!r}"
+                            )
+                    except Exception as e:
+                        print(f"  [WARN] write failed: {e}")
+                # Always mark URL processed so daily runs do not re-extract the same post
                 if tracker_path:
                     append_processed_link(tracker_path, norm, processed_urls)
                 print(f"  Processed {i + 1}/{len(to_process)}: {url[:60]}...")
             skipped_tracker = len(links) - len(to_process)
-            if sheet is not None:
-                print(f"\nWrote {written_total} event(s) to Google Sheet (input).")
+            print(
+                f"\nWrote {written_event} event(s) to {EVENT_SHEET_TAB}, "
+                f"{written_input} to {INPUT_SHEET_TAB} (manual review)."
+            )
             if skipped_tracker:
                 print(f"Skipped {skipped_tracker} link(s) already in tracker.")
 
