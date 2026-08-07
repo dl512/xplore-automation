@@ -54,7 +54,7 @@ EVENT_KEYS = ("event_name", "date", "time", "venue", "cost")
 
 # OpenRouter: extract_info_with_model_fallback tries these first, then Gemma.
 DEFAULT_LLM_PRIMARY_MODELS = [
-    "openai/gpt-4.1-nano",
+    "openai/gpt-5-mini",
     "openai/gpt-4o-mini",
     "openai/gpt-3.5-turbo",
 ]
