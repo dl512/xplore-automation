@@ -2,7 +2,7 @@
 """
 Crawl Instagram home feed and optionally detect events, extract details, save to Google Sheet.
 
-Uses cookies.pkl and Selenium (same as crawl_ig_saved_posts.py).
+Uses cookies.pkl and Selenium (same as process_ig_read_sheet.py).
 Event detection uses is_event_post() in extraction_details.py (same rules as xplore_automation).
 
 Usage:
@@ -30,7 +30,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 load_dotenv(override=True)
 
-from crawl_ig_saved_posts import (
+from process_ig_read_sheet import (
     COOKIES_FILE,
     DELAY_BETWEEN_POSTS,
     EVENT_SHEET_TAB,
@@ -45,6 +45,7 @@ from crawl_ig_saved_posts import (
     extract_username_and_details,
     get_content_sync,
     init_input_and_event_sheets,
+    is_logged_in,
     load_cookies,
     load_processed_links,
     normalize_post_url,
@@ -206,8 +207,7 @@ def extract_feed_post_links(driver, scroll_pause=3, max_scrolls=20):
 
 
 def is_login_wall(driver):
-    url = driver.current_url or ""
-    return "accounts/login" in url or "challenge" in url
+    return not is_logged_in(driver)
 
 
 def _is_event_yes(result):

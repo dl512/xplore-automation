@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-import crawl_ig_saved_posts as crawl
+import process_ig_read_sheet as crawl
 import extraction_details as ed
 
 CACHE_URLS_FILE = "extraction_prompt_tuning_urls.txt"
@@ -136,7 +136,7 @@ def open_logged_in_driver(args):
             pass
         print(
             f"No {crawl.COOKIES_FILE} found. "
-            "Run: python crawl_ig_saved_posts.py --save-cookies"
+            "Run: python process_ig_read_sheet.py --save-cookies"
         )
         sys.exit(1)
     # Land on IG so session cookies apply

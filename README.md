@@ -1,12 +1,12 @@
 # xplore-automation
 
-Instagram **saved posts** crawler with optional event extraction to Google Sheets and photo upload to GCS (`ig-photo`).
+Instagram **read-sheet** pipeline: pull queued IG links from a Google Sheet, extract events to the write sheet, and skip duplicates already in the database.
 
 ## What’s in this repo
 
 | File | Role |
 |------|------|
-| `crawl_ig_saved_posts.py` | Selenium crawl, `extract_info_with_model_fallback`, sheet write |
+| `process_ig_read_sheet.py` | Read-sheet queue, `extract_info_with_model_fallback`, write-sheet + GCS photo |
 | `extraction_details.py` | Event JSON extraction, tags, category |
 | `llm_env.py` | `AI_GATEWAY_API_KEY` (Vercel) or `OPENAI_API_KEY` + `BASE_URL` |
 
@@ -36,17 +36,17 @@ Instagram **saved posts** crawler with optional event extraction to Google Sheet
      `GOOGLE_SERVICE_ACCOUNT_JSON=/home/you/secrets/xplore-sa.json`
    - Run once with display (or X11) to create cookies:
      ```bash
-     python crawl_ig_saved_posts.py --save-cookies --no-headless
+     python process_ig_read_sheet.py --save-cookies --no-headless
      ```
      That writes `cookies.pkl` (gitignored).
 
 5. **Run**
    ```bash
-   python crawl_ig_saved_posts.py
+   python process_ig_read_sheet.py
    ```
    Links-only (no LLM / sheet):
    ```bash
-   python crawl_ig_saved_posts.py --no-extract
+   python process_ig_read_sheet.py --no-extract
    ```
 
 ## LLM routing
