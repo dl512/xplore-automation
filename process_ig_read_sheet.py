@@ -67,7 +67,12 @@ from extraction_details import (
     sheet_available_formula,
     sheet_beginning_date_formula,
 )
-from update_event_dates import normalize_date_for_sheet
+
+try:
+    from update_event_dates import normalize_date_for_sheet
+except ImportError:
+    def normalize_date_for_sheet(h, as_of=None):
+        return (h or "").strip()
 
 # Google Sheet + GCS (standalone: set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS)
 gspread = None

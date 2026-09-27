@@ -2,15 +2,20 @@
 """
 Daily rule-based update of event dates in Google Sheets (column H).
 
-Intended to run around 23:00. On calendar day D (e.g. 7/8 at 11pm):
-  1. Pre-screen: Available (column A) == "Y"
-  2. Only rows whose beginning date (column I) equals *today* (D)
-  3. Roll column H as if the next day had already started (effective date = D+1)
+Also used on ingest (crawl) via normalize_date_for_sheet() so mid-run adds like
+1/8-31/8 or 1/8, 2/8, 16/8 stay Available=Y when still ongoing.
 
-So at 11pm on 7/8, rows with I=7/8 and A=Y are updated with threshold 8/8:
-  - 7/8                         -> unchanged (single-day; let it lapse)
+Intended nightly run around 23:00. On calendar day D (e.g. 7/8 at 11pm):
+  - Scan every row with a date in H
+  - Roll H as of tomorrow (D+1): drop past days / clamp range starts
+  - Beginning (I) and Available (A) formulas then follow the new H
+
+Examples with effective date 8/8:
+  - 7/8                         -> unchanged (single-day; let Available lapse)
   - 7/8-16/8                    -> 8/8-16/8
+  - 1/8-31/8                    -> 8/8-31/8   (ongoing; do not discard)
   - 7/8, 11/8, 14/8, 20/8, ...  -> 11/8, 14/8, 20/8, ...
+  - 1/8, 2/8, 16/8, 17/8        -> 16/8, 17/8
   - 7/8-8/8                     -> 8/8
 
 Usage:
@@ -129,8 +134,11 @@ def parse_beginning_cell(value, today: date) -> date | None:
 
 def update_date_string(h: str, today: date) -> str | None:
     """
-    Apply roll rules to column H text.
+    Apply roll rules to column H text relative to *today* (effective day).
     Returns new string, or None if unchanged / should not update.
+
+    Ongoing events whose start is already past but end/future dates remain
+    are clamped (e.g. 1/8-31/8 on 9/8 -> 9/8-31/8), not discarded.
     """
     raw = (h or "").strip()
     if not raw or raw.upper() == "N/A":
@@ -185,6 +193,19 @@ def update_date_string(h: str, today: date) -> str | None:
     return None
 
 
+def normalize_date_for_sheet(h: str, as_of: date | None = None) -> str:
+    """
+    Clamp H for sheet write / nightly roll so beginning is not before as_of.
+    Returns original text when no change is needed (or unparseable / all past).
+    """
+    raw = (h or "").strip()
+    if not raw:
+        return raw
+    effective = as_of or date.today()
+    new_h = update_date_string(raw, effective)
+    return new_h if new_h is not None else raw
+
+
 DEFAULT_WORKSHEET = "Event(new)"
 
 
@@ -225,9 +246,10 @@ def process_worksheet(
     dry_run: bool = False,
 ) -> tuple[int, int]:
     """
-    At ~23:00 on run_date: update H for rows with A=Y and I==run_date,
-    rolling dates relative to tomorrow (run_date + 1).
-    Returns (candidates, updated).
+    At ~23:00 on run_date: for every row with a date in H, roll relative to
+    tomorrow (run_date + 1). Fixes stale mid-range / comma-list rows even if
+    Available is already N because beginning (I) was left in the past.
+    Returns (scanned, updated).
     """
     tomorrow = run_date + timedelta(days=1)
     ws = open_worksheet(worksheet_name)
@@ -239,33 +261,24 @@ def process_worksheet(
         return 0, 0
 
     updates: list[dict] = []
-    candidates = 0
+    scanned = 0
 
     for i, row in enumerate(cells):
         row_num = i + 2  # sheet row
-        a_val = row[0] if len(row) > 0 else ""
         h_val = row[7] if len(row) > 7 else ""
-        i_val = row[8] if len(row) > 8 else ""
 
-        if not is_available_yes(a_val):
-            continue
-
-        beginning = parse_beginning_cell(i_val, run_date)
-        if beginning != run_date:
-            continue
-
-        candidates += 1
         h_str = "" if h_val is None else str(h_val).strip()
+        if not h_str or h_str.upper() == "N/A":
+            continue
         if isinstance(h_val, (int, float)) and not isinstance(h_val, bool):
             print(f"  [skip] row {row_num}: H looks numeric ({h_val})")
             continue
 
+        scanned += 1
+
         # Roll as of tomorrow (11pm run prepares dates for the next calendar day)
         new_h = update_date_string(h_str, tomorrow)
         if new_h is None:
-            print(
-                f"  [keep] row {row_num}: A=Y I={format_dm(beginning)} H={h_str!r}"
-            )
             continue
         print(
             f"  [{'DRY' if dry_run else 'upd'}] row {row_num}: "
@@ -284,10 +297,10 @@ def process_worksheet(
     print(
         f"[{worksheet_name}] run_date={format_dm(run_date)} "
         f"roll_as_of={format_dm(tomorrow)}: "
-        f"{candidates} candidate(s) (A=Y & I=today), {len(updates)} update(s)"
+        f"{scanned} date row(s) scanned, {len(updates)} update(s)"
         + (" (dry-run)" if dry_run else "")
     )
-    return candidates, len(updates)
+    return scanned, len(updates)
 
 
 def parse_today_arg(s: str | None) -> date:
@@ -319,6 +332,9 @@ def self_test() -> None:
         ("11/8, 14/8", None),  # all future
         ("N/A", None),
         ("6/8-7/8", None),  # fully past relative to 8/8
+        # Mid-month ingest / stale rows (ongoing must not be discarded)
+        ("1/8-31/8", "8/8-31/8"),
+        ("1/8, 2/8, 16/8, 17/8", "16/8, 17/8"),
     ]
     failed = 0
     for inp, expected in cases:
@@ -327,6 +343,14 @@ def self_test() -> None:
         print(f"  {'OK' if ok else 'FAIL'}: {inp!r} -> {got!r} (expected {expected!r})")
         if not ok:
             failed += 1
+
+    # Ingest normalize as of calendar "today" (not tomorrow)
+    mid = date(2026, 8, 9)
+    assert normalize_date_for_sheet("1/8-31/8", mid) == "9/8-31/8"
+    assert normalize_date_for_sheet("1/8, 2/8, 16/8, 17/8", mid) == "16/8, 17/8"
+    assert normalize_date_for_sheet("16/8-31/8", mid) == "16/8-31/8"  # future start
+    assert normalize_date_for_sheet("1/8-5/8", mid) == "1/8-5/8"  # all past, leave
+
     y = parse_beginning_cell("7/8/2026", run_date)
     assert y == date(2026, 8, 7), y
     serial = (date(2026, 8, 7) - _SHEETS_EPOCH).days
@@ -341,8 +365,8 @@ def self_test() -> None:
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "At ~23:00: for Available=Y rows whose beginning date (I) is today, "
-            "roll multi-day dates in H as of tomorrow."
+            "At ~23:00: roll every date cell in H as of tomorrow so ongoing "
+            "ranges/lists stay Available=Y (I/A formulas follow H)."
         )
     )
     parser.add_argument(
@@ -380,8 +404,7 @@ def main():
     print(f"Sheet: {GOOGLE_SHEET_ID}")
     print(
         f"Run date (11pm day): {run_date.isoformat()} ({format_dm(run_date)}); "
-        f"filter A=Y & I=={format_dm(run_date)}; "
-        f"roll H as of {format_dm(tomorrow)}"
+        f"scan all H date rows; roll H as of {format_dm(tomorrow)}"
     )
     print(f"Tabs: {', '.join(worksheets)}" + (" [dry-run]" if args.dry_run else ""))
 
@@ -395,7 +418,7 @@ def main():
             print(f"[{name}] ERROR: {e}", file=sys.stderr)
             raise SystemExit(1) from e
 
-    print(f"Done. {total_c} candidate(s), {total_u} update(s).")
+    print(f"Done. {total_c} date row(s) scanned, {total_u} update(s).")
 
 
 if __name__ == "__main__":
