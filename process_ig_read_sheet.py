@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Read sheet (queue): Instagram link, profile, post date, caption.
-Write sheet (database): Event(new) + input.
+Read sheet (queue): Instagram links (column A). Caption is fetched with yt-dlp,
+not from the sheet. Write sheet (database): Event(new) + input.
 
 Workflow: load existing links from the write sheet into a temp list. Walk the
 read sheet top to bottom. If a link is already in the temp list, delete that
-read-sheet row. Otherwise extract, write, add the link to the temp list, then
-delete the row. Duplicate links on the read sheet are processed at most once.
+read-sheet row. Otherwise fetch caption via yt-dlp, extract, write, add the
+link to the temp list, then delete the row. Duplicate links on the read sheet
+are processed at most once.
 
 Read sheet:  https://docs.google.com/spreadsheets/d/1UkOAZZEv780FHvPwras-MqXeVLoCFAmdYtWjymdHfX8
-  A=link, B=profile name, C=post date, D=caption
+  A=link (required). B/C used only if yt-dlp omits username/date.
 
-No Instagram login. Photo is the public /media/?size=l URL uploaded to GCS.
+No Instagram login. Photo is the yt-dlp thumbnail URL written as-is (not GCS).
 
 Usage:
   python process_ig_read_sheet.py --save-cookies --no-headless
@@ -51,6 +52,11 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 load_dotenv(override=True)
 
@@ -467,6 +473,103 @@ def normalize_queue_post_date(raw):
     return s
 
 
+def _ytdlp_post_date(info):
+    """yt-dlp timestamp or upload_date → 'September 25, 2026'."""
+    ts = info.get("timestamp") if info else None
+    if ts not in (None, ""):
+        try:
+            dt = datetime.fromtimestamp(int(ts))
+            return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+        except (TypeError, ValueError, OSError):
+            pass
+    upload_date = str((info or {}).get("upload_date") or "").strip()
+    if len(upload_date) == 8 and upload_date.isdigit():
+        try:
+            dt = datetime.strptime(upload_date, "%Y%m%d")
+            return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+        except ValueError:
+            pass
+    return ""
+
+
+def _ytdlp_photo_url(info):
+    """Pick the best image URL from yt-dlp thumbnail / thumbnails. No download."""
+    info = info or {}
+    candidates = []
+    top = (info.get("thumbnail") or "").strip()
+    if top.startswith("http"):
+        candidates.append((0, top))
+    for t in info.get("thumbnails") or []:
+        if not isinstance(t, dict):
+            continue
+        u = (t.get("url") or "").strip()
+        if not u.startswith("http"):
+            continue
+        try:
+            w = int(t.get("width") or 0)
+            h = int(t.get("height") or 0)
+        except (TypeError, ValueError):
+            w, h = 0, 0
+        candidates.append((w * h, u))
+    if not candidates:
+        return ""
+    sized = [c for c in candidates if c[0] > 0]
+    if sized:
+        return max(sized, key=lambda c: c[0])[1]
+    return candidates[-1][1]
+
+
+def _ytdlp_username(info):
+    """Prefer the IG handle (channel) over a numeric uploader_id."""
+    info = info or {}
+    channel = str(info.get("channel") or "").strip().lstrip("@")
+    uploader_id = str(info.get("uploader_id") or "").strip().lstrip("@")
+    uploader = str(info.get("uploader") or "").strip().lstrip("@")
+    if channel:
+        return channel
+    if uploader_id and not uploader_id.isdigit():
+        return uploader_id
+    return uploader_id or uploader
+
+
+def fetch_ig_post_via_ytdlp(post_url):
+    """Fetch Instagram caption, photo URL, and username/date with yt-dlp.
+
+    Does not download media. Photo is the CDN thumbnail URL as-is.
+    Returns a dict or None if extraction fails.
+    """
+    if yt_dlp is None:
+        print("  [WARN] yt-dlp is not installed. Run: pip install yt-dlp")
+        return None
+    ydl_opts = {
+        "skip_download": True,
+        "ignore_no_formats_error": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(post_url, download=False)
+    except Exception as e:
+        print(f"  [WARN] yt-dlp failed for {post_url[:70]}: {e}")
+        return None
+    if not info:
+        return None
+    if info.get("_type") in {"playlist", "multi_video"}:
+        entries = [e for e in (info.get("entries") or []) if e]
+        if entries:
+            info = entries[0]
+    caption = (info.get("description") or info.get("title") or "").strip()
+    link = info.get("webpage_url") or post_url
+    return {
+        "caption": caption,
+        "url": ig_url_from_text(link) or post_url,
+        "username": _ytdlp_username(info),
+        "post_date": _ytdlp_post_date(info) or None,
+        "photo_url": _ytdlp_photo_url(info),
+    }
+
+
 def ig_url_from_text(raw):
     """Normalized /p/ or /reel/ URL, or empty."""
     text = (raw or "").strip()
@@ -502,11 +605,13 @@ def load_write_sheet_links(*sheets):
 
 
 def parse_read_sheet_row(row, row_number):
-    """Parse one read-sheet row. Returns 'header', None (skip), or a post dict."""
+    """Parse one read-sheet row. Returns 'header', None (skip), or a post dict.
+
+    Caption is not read from the sheet; process_one_post fetches it with yt-dlp.
+    """
     raw = (row[0] if len(row) > 0 else "").strip()
     username = (row[1] if len(row) > 1 else "").strip().lstrip("@")
     post_date_raw = (row[2] if len(row) > 2 else "").strip()
-    caption = (row[3] if len(row) > 3 else "").strip()
     if row_number == 1 and raw.lower() in {"url", "link", "links", "instagram"}:
         return "header"
     url = ig_url_from_text(raw)
@@ -517,7 +622,6 @@ def parse_read_sheet_row(row, row_number):
         "url": url,
         "username": username,
         "post_date": normalize_queue_post_date(post_date_raw),
-        "caption": caption,
     }
 
 
@@ -656,7 +760,7 @@ def write_event_routed(
 
 
 def build_event_info(username, response, tags, category, url, photo_url=None):
-    """Build list of event dicts for sheet (same columns as xplore_automation). Photo from extract_photo or N/A."""
+    """Build list of event dicts for sheet. Photo is a URL string or N/A."""
     photo = (photo_url or "").strip() or "N/A"
     events = []
     for event in response:
@@ -1540,12 +1644,35 @@ def process_one_post(post, driver, input_sheet, input_row, event_sheet, event_ro
     username = (post.get("username") or "").strip().lstrip("@")
     details_str = (post.get("caption") or "").strip()
     post_date = post.get("post_date")
+    photo_url = ""
     written_input = 0
     written_event = 0
 
     time.sleep(DELAY_BETWEEN_POSTS)
 
-    if not details_str and driver is not None:
+    if driver is None:
+        meta = fetch_ig_post_via_ytdlp(url)
+        if not meta:
+            print(f"  [retry later] yt-dlp failed: {url[:70]}")
+            return "retry", input_sheet, input_row, event_sheet, event_row, 0, 0
+        details_str = (meta.get("caption") or "").strip()
+        if meta.get("url"):
+            url = meta["url"]
+        if meta.get("username"):
+            username = meta["username"]
+        if meta.get("post_date"):
+            post_date = meta["post_date"]
+        photo_url = (meta.get("photo_url") or "").strip()
+        print(
+            f"  [yt-dlp] {len(details_str)} chars"
+            f"{'  @' + username if username else ''}"
+            f"{'  ' + str(post_date) if post_date else ''}"
+            f"{'  photo' if photo_url else '  no photo'}"
+        )
+        if not details_str:
+            print(f"  [retry later] yt-dlp returned no caption: {url[:70]}")
+            return "retry", input_sheet, input_row, event_sheet, event_row, 0, 0
+    elif not details_str:
         soup = get_content_sync(url, driver=driver)
         if not soup:
             print(f"  [retry later] fetch failed: {url[:70]}")
@@ -1569,7 +1696,8 @@ def process_one_post(post, driver, input_sheet, input_row, event_sheet, event_ro
         print(f"  [WARN] extract_info (all models) failed for {url}: {e}")
         return "retry", input_sheet, input_row, event_sheet, event_row, 0, 0
 
-    photo_url = extract_photo(url)
+    if driver is not None and not photo_url:
+        photo_url = extract_photo(url)
     event_list = build_event_info(
         username, response, tags, category, url, photo_url=photo_url
     )
@@ -1814,7 +1942,7 @@ def login_instagram(driver, interactive, switch_account=None):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Read sheet -> write sheet: skip (and delete) links already in the database; "
+            "Read sheet -> write sheet: fetch captions with yt-dlp, skip duplicates, "
             "extract new ones, then delete the read-sheet row."
         )
     )
