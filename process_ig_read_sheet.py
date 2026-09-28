@@ -153,6 +153,11 @@ def extract_shortcode_from_url(url):
     return m.group(1) if m else ""
 
 
+def ig_post_key(raw):
+    """Dedup key: Instagram shortcode, so www /p/ vs /reel/ still match."""
+    return extract_shortcode_from_url(ig_url_from_text(raw) or raw or "")
+
+
 def get_requests_session():
     """requests.Session with cookies.pkl (for post HTML when Selenium driver is unavailable)."""
     global _ig_requests_session
@@ -601,9 +606,9 @@ def load_write_sheet_links(*sheets):
             continue
         n = 0
         for cell in col[1:]:
-            url = ig_url_from_text(cell)
-            if url and url not in known:
-                known.add(url)
+            key = ig_post_key(cell)
+            if key and key not in known:
+                known.add(key)
                 n += 1
         print(f"  Write sheet {title!r}: {n} existing Instagram link(s).")
     return known
@@ -1776,7 +1781,8 @@ def process_read_sheet(
     """Walk the read sheet top to bottom.
 
     If the link is already in known_links (write sheet or seen earlier this run),
-    delete the row. Otherwise add it to known_links, extract, then delete.
+    delete that read-sheet row without extracting. Otherwise add it, extract, then
+    delete.
     """
     written_input = 0
     written_event = 0
@@ -1805,14 +1811,15 @@ def process_read_sheet(
             continue
 
         url = parsed["url"]
+        key = ig_post_key(url)
         extra = ""
         if parsed.get("username"):
             extra += f"  @{parsed['username']}"
         if parsed.get("post_date"):
             extra += f"  {parsed['post_date']}"
 
-        if url in known_links:
-            print(f"  [dup] already in write sheet / this run:{extra} {url}")
+        if key and key in known_links:
+            print(f"  [dup] already processed — delete row {row_number}:{extra} {url}")
             skipped_dup += 1
             if dry_run or keep_queue:
                 i += 1
@@ -1825,7 +1832,8 @@ def process_read_sheet(
             continue
 
         print(f"  [new]{extra} {url}")
-        known_links.add(url)
+        if key:
+            known_links.add(key)
         if dry_run:
             i += 1
             continue
